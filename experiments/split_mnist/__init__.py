@@ -8,3 +8,4 @@ from .rwalk import rwalk_smnist
 from .naive import naive_smnist
 from .online_replay import online_replay_smnist
 from .mir import mir_smnist
+from .skill_memory import skill_memory_smnist

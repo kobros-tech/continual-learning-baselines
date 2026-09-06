@@ -78,6 +78,7 @@ For some strategies (e.g., LaMAML) you may need to install Avalanche with extra 
 For more details on how to install Avalanche, please check out the complete guide [here](https://avalanche.continualai.org/getting-started/how-to-install). 
 * **PyTorch**: we recommend to follow [the official guide](https://pytorch.org/get-started/locally/).
 * **Pandas**: `pip install pandas`. [Official guide](https://pandas.pydata.org/docs/getting_started/install.html#installing-pandas).
+* **Skill Memory**: install the exact package revision used by this baseline: `pip install git+https://github.com/kobros-tech/skill-memory.git@46542ae43122bb3a2f6c84eabed67b9b05ec4e34`. The baseline imports `SkillMemoryPlugin` from the package rather than maintaining a local copy.
 
 
 ## Run experiments with Python
