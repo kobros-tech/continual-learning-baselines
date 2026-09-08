@@ -123,7 +123,10 @@ class SkillMemoryTest(unittest.TestCase):
                 else:
                     self.assertAlmostEqual(reference_stats[name][statistic], midpoint_stats[name][statistic], places=6)
 
-        criterion = nn.CrossEntropyLoss()
+        with torch.no_grad():
+            reference_model = TinyNet()
+            reference_model.load_state_dict(reference_state)
+            reference_logits = reference_model(eval_x)
 
         def evaluate(candidate_state):
             model = TinyNet()
@@ -131,9 +134,12 @@ class SkillMemoryTest(unittest.TestCase):
             model.eval()
             with torch.no_grad():
                 logits = model(eval_x)
-                loss = float(criterion(logits, eval_y).item())
+                # Compatibility is a positive behavioral score: the closer the
+                # candidate is to the trained reference behavior, the higher it is.
+                behavior_error = torch.mean((logits - reference_logits) ** 2).item()
+                compatibility = float(torch.exp(torch.tensor(-behavior_error)).item())
                 accuracy = float((logits.argmax(dim=1) == eval_y).float().mean().item())
-            return -loss, accuracy
+            return compatibility, accuracy
 
         result = find_best_weight_clone(
             state_a, state_b, evaluate,
