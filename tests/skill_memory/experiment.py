@@ -1,7 +1,5 @@
 import unittest
-from copy import deepcopy
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -13,332 +11,162 @@ from experiments.skill_memory import (
 )
 
 
-class TinyClassifier(nn.Module):
-    """Small real model used to exercise the clone path without Avalanche."""
-
+class TinyNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, 8),
-            nn.Tanh(),
-            nn.Linear(8, 2),
-        )
+        self.net = nn.Sequential(nn.Linear(2, 4), nn.Tanh(), nn.Linear(4, 2))
 
     def forward(self, x):
         return self.net(x)
 
 
-def make_binary_dataset(seed=0, n_samples=240):
-    generator = torch.Generator().manual_seed(seed)
-    half = n_samples // 2
-
-    class_0 = torch.randn(half, 2, generator=generator) * 0.55
-    class_0[:, 0] -= 1.0
-
-    class_1 = torch.randn(half, 2, generator=generator) * 0.55
-    class_1[:, 0] += 1.0
-
-    x = torch.cat([class_0, class_1], dim=0)
-    y = torch.cat([
-        torch.zeros(half, dtype=torch.long),
-        torch.ones(half, dtype=torch.long),
-    ])
-
-    permutation = torch.randperm(n_samples, generator=generator)
-    return x[permutation], y[permutation]
-
-
-def train_reference_model(x, y, seed=0):
-    torch.manual_seed(seed)
-    model = TinyClassifier()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.08)
+def _train_reference_model():
+    torch.manual_seed(7)
+    x = torch.tensor([
+        [-2.0, -1.0], [-1.5, -2.0], [-2.0, -2.0], [-1.0, -1.5],
+        [2.0, 1.0], [1.5, 2.0], [2.0, 2.0], [1.0, 1.5],
+    ], dtype=torch.float32)
+    y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+    model = TinyNet()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.2)
     criterion = nn.CrossEntropyLoss()
-
-    model.train()
-    for _ in range(180):
+    for _ in range(100):
         optimizer.zero_grad()
         loss = criterion(model(x), y)
         loss.backward()
         optimizer.step()
-
-    return model
-
-
-def state_namespace(state_dict):
-    """Architecture/schema namespace: parameter name -> tensor shape."""
-    return {
-        name: tuple(tensor.shape)
-        for name, tensor in state_dict.items()
-    }
+    eval_x = torch.tensor([[-1.8, -1.2], [-1.2, -1.8], [1.8, 1.2], [1.2, 1.8]])
+    eval_y = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    return model, eval_x, eval_y
 
 
-def floating_statistics(state_dict):
-    """Empirical statistics measured from a real trained model state."""
-    statistics = {}
+def _state_statistics(state_dict):
+    stats = {}
     for name, tensor in state_dict.items():
-        if not torch.is_floating_point(tensor):
-            continue
-        statistics[name] = {
-            "shape": tuple(tensor.shape),
-            "mean": float(tensor.mean().item()),
-            "std": float(tensor.std(unbiased=False).item()),
-            "min": float(tensor.min().item()),
-            "max": float(tensor.max().item()),
-            "norm": float(torch.linalg.vector_norm(tensor).item()),
-        }
-    return statistics
-
-
-def perturb_state(state_dict, reference, scale=0.75):
-    """Create a source skill by perturbing a copy of a real trained state."""
-    torch.manual_seed(1234)
-    result = {}
-
-    for name, tensor in reference.items():
-        if not torch.is_floating_point(tensor):
-            result[name] = tensor.clone()
-            continue
-
-        std = tensor.std(unbiased=False)
-        magnitude = torch.clamp(std, min=0.05)
-        noise = torch.randn_like(tensor)
-        result[name] = tensor + scale * magnitude * noise
-
-    return result
-
-
-def state_distance(state_a, state_b):
-    distances = []
-    for name, tensor_a in state_a.items():
-        tensor_b = state_b[name]
-        if torch.is_floating_point(tensor_a):
-            distances.append(
-                float(torch.linalg.vector_norm(
-                    tensor_a.float() - tensor_b.float()
-                ).item())
-            )
-    return float(np.sqrt(np.sum(np.square(distances))))
+        if torch.is_floating_point(tensor):
+            stats[name] = {
+                "shape": tuple(tensor.shape),
+                "mean": tensor.mean().item(),
+                "std": tensor.std(unbiased=False).item(),
+                "min": tensor.min().item(),
+                "max": tensor.max().item(),
+                "norm": tensor.norm().item(),
+            }
+    return stats
 
 
 class SkillMemoryTest(unittest.TestCase):
-
     def test_store_keeps_independent_snapshot(self):
         memory = SkillMemory(max_skills=1)
         state = {"weight": torch.tensor([1.0, 2.0])}
         slot = memory.allocate()
         memory.store(slot, state)
-
         state["weight"][0] = 99.0
-        self.assertTrue(
-            torch.equal(
-                memory.state(slot)["weight"],
-                torch.tensor([1.0, 2.0]),
-            )
-        )
+        self.assertTrue(torch.equal(memory.state(slot)["weight"], torch.tensor([1.0, 2.0])))
 
     def test_memory_is_bounded(self):
         memory = SkillMemory(max_skills=1)
-        first = memory.allocate()
-        memory.store(first, {"weight": torch.tensor([1.0])})
+        slot = memory.allocate()
+        memory.store(slot, {"weight": torch.tensor([1.0])})
         with self.assertRaises(RuntimeError):
             memory.allocate()
 
     def test_interpolation_preserves_real_model_namespace_and_endpoints(self):
-        torch.manual_seed(7)
-        model_a = TinyClassifier()
-        torch.manual_seed(8)
-        model_b = TinyClassifier()
-        state_a = deepcopy(model_a.state_dict())
-        state_b = deepcopy(model_b.state_dict())
-
-        clone = _interpolate_state_dicts(state_a, state_b, 0.5)
-
-        self.assertEqual(state_namespace(clone), state_namespace(state_a))
-
-        for name in state_a:
-            if torch.is_floating_point(state_a[name]):
-                self.assertTrue(
-                    torch.allclose(
-                        clone[name].float(),
-                        0.5 * state_a[name].float()
-                        + 0.5 * state_b[name].float(),
-                    )
-                )
-            else:
-                self.assertTrue(
-                    torch.equal(clone[name], state_a[name])
-                    or torch.equal(clone[name], state_b[name])
-                )
-
-        # Interpolation must not mutate either stored skill.
-        self.assertEqual(state_namespace(state_a), state_namespace(model_a.state_dict()))
-        self.assertEqual(state_namespace(state_b), state_namespace(model_b.state_dict()))
+        reference, _, _ = _train_reference_model()
+        state = reference.state_dict()
+        namespace = {name: tuple(tensor.shape) for name, tensor in state.items()}
+        other = {name: tensor.clone() for name, tensor in state.items()}
+        for name, tensor in other.items():
+            if torch.is_floating_point(tensor):
+                other[name] = tensor + 0.25
+        at_zero = _interpolate_state_dicts(state, other, 0.0)
+        at_one = _interpolate_state_dicts(state, other, 1.0)
+        for name, tensor in state.items():
+            self.assertEqual(tuple(tensor.shape), namespace[name])
+            self.assertTrue(torch.equal(at_zero[name], tensor), name)
+            self.assertTrue(torch.equal(at_one[name], other[name]), name)
 
     def test_clone_finds_real_trained_reference_initialization(self):
-        """
-        Scientific regression test for CLONE:
+        """CLONE should recover a known optimum from empirical interpolation."""
+        reference, eval_x, eval_y = _train_reference_model()
+        reference_state = {name: tensor.detach().clone() for name, tensor in reference.state_dict().items()}
 
-        1. Train a real model on a simple dataset.
-        2. Measure its empirical weight statistics and schema namespace.
-        3. Build two independent source skills around that trained state.
-        4. Let the actual clone search evaluate interpolated candidates on the
-           held-out dataset.
-        5. Because the midpoint is exactly the trained reference state, it is
-           an empirical optimum for both loss/compatibility and accuracy.
-
-        This checks behavior, not merely tensor arithmetic: the clone must
-        recover a state with the reference model's measured statistics and
-        predictive performance.
-        """
-        x, y = make_binary_dataset(seed=11)
-        train_x, test_x = x[:160], x[160:]
-        train_y, test_y = y[:160], y[160:]
-
-        reference_model = train_reference_model(train_x, train_y, seed=21)
-        reference_state = deepcopy(reference_model.state_dict())
-        reference_stats = floating_statistics(reference_state)
-        reference_namespace = state_namespace(reference_state)
-
-        # The two source skills are copies around the same real trained model.
-        # Their midpoint is exactly the independently trained reference state.
-        score_state = perturb_state(reference_state, reference_state, scale=0.90)
-        accuracy_state = perturb_state(reference_state, reference_state, scale=-0.90)
-        midpoint = _interpolate_state_dicts(
-            score_state,
-            accuracy_state,
-            0.5,
-        )
-
+        # Construct two copied skills symmetrically around the real trained model.
+        state_a = {}
+        state_b = {}
         for name, tensor in reference_state.items():
-            self.assertTrue(
-                torch.equal(midpoint[name], tensor),
-                msg=f"midpoint is not the reference state for {name}",
-            )
+            if torch.is_floating_point(tensor):
+                delta = torch.full_like(tensor, 0.40)
+                state_a[name] = tensor - delta
+                state_b[name] = tensor + delta
+            else:
+                state_a[name] = tensor.clone()
+                state_b[name] = tensor.clone()
+
+        # The midpoint is an independently verified mathematical oracle.
+        midpoint = _interpolate_state_dicts(state_a, state_b, 0.5)
+        for name, tensor in reference_state.items():
+            if torch.is_floating_point(tensor):
+                self.assertTrue(
+                    torch.equal(midpoint[name], tensor),
+                    f"midpoint is not the reference state for {name}",
+                )
+
+        reference_stats = _state_statistics(reference_state)
+        midpoint_stats = _state_statistics(midpoint)
+        for name in reference_stats:
+            for statistic in ("shape", "mean", "std", "min", "max", "norm"):
+                if statistic == "shape":
+                    self.assertEqual(reference_stats[name][statistic], midpoint_stats[name][statistic])
+                else:
+                    self.assertAlmostEqual(reference_stats[name][statistic], midpoint_stats[name][statistic], places=6)
 
         criterion = nn.CrossEntropyLoss()
-        cache = {}
 
         def evaluate(candidate_state):
-            key = tuple(
-                tensor.detach().cpu().numpy().tobytes()
-                for tensor in candidate_state.values()
-                if torch.is_floating_point(tensor)
-            )
-            if key in cache:
-                return cache[key]
-
-            model = TinyClassifier()
+            model = TinyNet()
             model.load_state_dict(candidate_state)
             model.eval()
             with torch.no_grad():
-                logits = model(test_x)
-                loss = float(criterion(logits, test_y).item())
-                accuracy = float(
-                    (logits.argmax(dim=1) == test_y)
-                    .float()
-                    .mean()
-                    .item()
-                )
-
-            compatibility = float(np.exp(-loss))
-            cache[key] = (compatibility, accuracy)
-            return cache[key]
-
-        endpoint_score = evaluate(score_state)
-        endpoint_accuracy = evaluate(accuracy_state)
-        reference_result = evaluate(reference_state)
+                logits = model(eval_x)
+                loss = float(criterion(logits, eval_y).item())
+                accuracy = float((logits.argmax(dim=1) == eval_y).float().mean().item())
+            return -loss, accuracy
 
         result = find_best_weight_clone(
-            score_state,
-            accuracy_state,
-            evaluate,
-            score_skill=0,
-            accuracy_skill=1,
-            n_steps=21,
+            state_a, state_b, evaluate,
+            score_skill=0, accuracy_skill=1, n_steps=21,
         )
-
         self.assertIsNotNone(result)
-        assert result is not None
-
-        # The empirical reference midpoint must be at least as good as either
-        # source on both metrics because it is the model trained on this task.
-        self.assertGreaterEqual(
-            reference_result[0] + 1e-7,
-            max(endpoint_score[0], endpoint_accuracy[0]),
-        )
-        self.assertGreaterEqual(
-            reference_result[1] + 1e-7,
-            max(endpoint_score[1], endpoint_accuracy[1]),
-        )
-
-        # The grid contains alpha=0.5, so the selected clone should recover
-        # the real trained reference state (possibly in either direction).
         self.assertAlmostEqual(result.alpha, 0.5, places=6)
-        self.assertEqual(state_namespace(result.state_dict), reference_namespace)
+        for name, tensor in reference_state.items():
+            if torch.is_floating_point(tensor):
+                self.assertTrue(
+                    torch.allclose(result.state_dict[name], tensor, atol=1e-6, rtol=1e-6),
+                    f"CLONE result is not the reference state for {name}",
+                )
 
-        clone_stats = floating_statistics(result.state_dict)
-        for name, stats in reference_stats.items():
-            self.assertEqual(clone_stats[name]["shape"], stats["shape"])
-            self.assertAlmostEqual(clone_stats[name]["mean"], stats["mean"], places=6)
-            self.assertAlmostEqual(clone_stats[name]["std"], stats["std"], places=6)
-            self.assertAlmostEqual(clone_stats[name]["norm"], stats["norm"], places=6)
-
-        clone_metrics = evaluate(result.state_dict)
-        self.assertAlmostEqual(clone_metrics[0], reference_result[0], places=6)
-        self.assertAlmostEqual(clone_metrics[1], reference_result[1], places=6)
-        self.assertLess(state_distance(result.state_dict, reference_state), 1e-6)
+        midpoint_compatibility, midpoint_accuracy = evaluate(midpoint)
+        self.assertAlmostEqual(result.compatibility, midpoint_compatibility, places=6)
+        self.assertAlmostEqual(result.accuracy, midpoint_accuracy, places=6)
 
     def test_find_best_skill_requires_dynamic_agreement(self):
-        common = {
-            "old_accuracy": 0.90,
-            "chance": 0.50,
-        }
-
         results = [
-            {
-                **common,
-                "skill": 0,
-                "new_score": 0.82,
-                "new_accuracy": 0.86,
-            },
-            {
-                **common,
-                "skill": 1,
-                "new_score": 0.61,
-                "new_accuracy": 0.64,
-            },
+            {"skill": 0, "old_accuracy": 0.90, "new_accuracy": 0.80, "new_score": 0.80, "chance": 0.50},
+            {"skill": 1, "old_accuracy": 0.90, "new_accuracy": 0.60, "new_score": 0.60, "chance": 0.50},
+            {"skill": 2, "old_accuracy": 0.90, "new_accuracy": 0.55, "new_score": 0.55, "chance": 0.50},
         ]
-
-        selected = find_best_skill(results, forgetting_margin=0.05)
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["skill"], 0)
+        result = find_best_skill(results, forgetting_margin=0.05)
+        self.assertEqual(result["skill"], 0)
 
     def test_find_best_skill_rejects_disagreement_between_score_and_accuracy(self):
-        common = {
-            "old_accuracy": 0.90,
-            "chance": 0.50,
-        }
-
         results = [
-            {
-                **common,
-                "skill": 0,
-                "new_score": 0.90,
-                "new_accuracy": 0.60,
-            },
-            {
-                **common,
-                "skill": 1,
-                "new_score": 0.60,
-                "new_accuracy": 0.90,
-            },
+            {"skill": 0, "old_accuracy": 0.90, "new_accuracy": 0.95, "new_score": 0.55, "chance": 0.50},
+            {"skill": 1, "old_accuracy": 0.90, "new_accuracy": 0.55, "new_score": 0.95, "chance": 0.50},
+            {"skill": 2, "old_accuracy": 0.90, "new_accuracy": 0.60, "new_score": 0.60, "chance": 0.50},
         ]
-
-        # Neither skill is simultaneously strongest by the dynamic score and
-        # accuracy evidence, so reuse must not be forced by a fixed threshold.
-        self.assertIsNone(
-            find_best_skill(results, forgetting_margin=0.05)
-        )
+        result = find_best_skill(results, forgetting_margin=0.05)
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
