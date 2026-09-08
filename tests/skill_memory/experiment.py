@@ -25,8 +25,8 @@ def _train_reference_model():
     x = torch.tensor([
         [-2.0, -1.0], [-1.5, -2.0], [-2.0, -2.0], [-1.0, -1.5],
         [2.0, 1.0], [1.5, 2.0], [2.0, 2.0], [1.0, 1.5],
-    ], dtype=torch.float32)
-    y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+    ])
+    y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
     model = TinyNet()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.2)
     criterion = nn.CrossEntropyLoss()
@@ -36,7 +36,7 @@ def _train_reference_model():
         loss.backward()
         optimizer.step()
     eval_x = torch.tensor([[-1.8, -1.2], [-1.2, -1.8], [1.8, 1.2], [1.2, 1.8]])
-    eval_y = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    eval_y = torch.tensor([0, 0, 1, 1])
     return model, eval_x, eval_y
 
 
@@ -91,7 +91,6 @@ class SkillMemoryTest(unittest.TestCase):
         reference, eval_x, eval_y = _train_reference_model()
         reference_state = {name: tensor.detach().clone() for name, tensor in reference.state_dict().items()}
 
-        # Construct two copied skills symmetrically around the real trained model.
         state_a = {}
         state_b = {}
         for name, tensor in reference_state.items():
@@ -103,12 +102,15 @@ class SkillMemoryTest(unittest.TestCase):
                 state_a[name] = tensor.clone()
                 state_b[name] = tensor.clone()
 
-        # The midpoint is an independently verified mathematical oracle.
+        # Floating-point interpolation is mathematically exact in real arithmetic,
+        # but subtraction/addition in float32 can introduce a few ulps of error.
+        # The oracle therefore uses a tight numerical tolerance rather than exact
+        # tensor equality.
         midpoint = _interpolate_state_dicts(state_a, state_b, 0.5)
         for name, tensor in reference_state.items():
             if torch.is_floating_point(tensor):
                 self.assertTrue(
-                    torch.equal(midpoint[name], tensor),
+                    torch.allclose(midpoint[name], tensor, atol=1e-6, rtol=1e-6),
                     f"midpoint is not the reference state for {name}",
                 )
 
